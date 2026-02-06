@@ -73,6 +73,10 @@ class GlobalAIMomentumStrategy(IStrategy):
         normalized = (series - min_v) / (max_v - min_v + 1e-9)
         return normalized.clip(0, 1)
 
+    @staticmethod
+    def _clip_threshold(series: pd.Series, lower: float, upper: float) -> pd.Series:
+        return series.fillna(lower).clip(lower=lower, upper=upper)
+
     def populate_indicators(self, dataframe: pd.DataFrame, metadata: Dict) -> pd.DataFrame:
         # Trend
         dataframe["ema_fast"] = ta.EMA(dataframe, timeperiod=21)
@@ -105,6 +109,16 @@ class GlobalAIMomentumStrategy(IStrategy):
         dataframe["ret_1"] = dataframe["close"].pct_change(1)
         dataframe["ret_6"] = dataframe["close"].pct_change(6)
         dataframe["ret_24"] = dataframe["close"].pct_change(24)
+        dataframe["rolling_volatility"] = dataframe["ret_1"].rolling(48).std()
+
+        # Trend persistence / regime features
+        dataframe["trend_persistence"] = (
+            (dataframe["close"] > dataframe["ema_fast"]).rolling(24).mean().fillna(0)
+        )
+        dataframe["downside_risk"] = dataframe["ret_1"].clip(upper=0).rolling(24).std()
+        dataframe["market_regime"] = (
+            (dataframe["ema_fast"] > dataframe["ema_slow"]) & (dataframe["adx"] > 18)
+        ).astype(int)
 
         # AI-like ranking score (multi-factor weighted)
         trend_strength = self._normalize_series((dataframe["ema_fast"] - dataframe["ema_slow"]) / dataframe["close"])
@@ -113,14 +127,25 @@ class GlobalAIMomentumStrategy(IStrategy):
         macd_quality = self._normalize_series(dataframe["macd"] - dataframe["macdsignal"])
         volume_quality = self._normalize_series(dataframe["volume_rel"])
         volatility_quality = 1 - self._normalize_series(dataframe["atr_pct"])  # lower ATR% = cleaner trend
+        persistence_quality = self._normalize_series(dataframe["trend_persistence"])
+        downside_penalty = self._normalize_series(dataframe["downside_risk"])
 
         dataframe["entry_score"] = (
-            0.26 * trend_strength
-            + 0.18 * trend_quality
+            0.24 * trend_strength
+            + 0.16 * trend_quality
             + 0.20 * macd_quality
-            + 0.16 * volume_quality
+            + 0.14 * volume_quality
             + 0.10 * volatility_quality
-            + 0.10 * momentum_quality
+            + 0.08 * momentum_quality
+            + 0.12 * persistence_quality
+            - 0.04 * downside_penalty
+        )
+        dataframe["entry_score"] = dataframe["entry_score"].clip(lower=0, upper=1)
+
+        dataframe["entry_threshold"] = self._clip_threshold(
+            dataframe["entry_score"].rolling(288, min_periods=96).quantile(0.70),
+            lower=0.56,
+            upper=0.76,
         )
 
         # Exit score focuses on momentum decay + volatility expansion
@@ -128,12 +153,19 @@ class GlobalAIMomentumStrategy(IStrategy):
         weakening_trend = self._normalize_series((dataframe["ema_mid"] - dataframe["ema_fast"]) / dataframe["close"])
         overbought = self._normalize_series(dataframe["rsi"] - 50)
         vol_spike = self._normalize_series(dataframe["atr_pct"])
+        regime_break = self._normalize_series((dataframe["ema_slow"] - dataframe["ema_fast"]) / dataframe["close"])
 
         dataframe["exit_score"] = (
-            0.35 * bearish_macd
-            + 0.25 * weakening_trend
+            0.30 * bearish_macd
+            + 0.22 * weakening_trend
             + 0.20 * overbought
-            + 0.20 * vol_spike
+            + 0.16 * vol_spike
+            + 0.12 * regime_break
+        )
+        dataframe["exit_threshold"] = self._clip_threshold(
+            dataframe["exit_score"].rolling(288, min_periods=96).quantile(0.65),
+            lower=0.52,
+            upper=0.74,
         )
 
         return dataframe
@@ -143,11 +175,14 @@ class GlobalAIMomentumStrategy(IStrategy):
             dataframe["volume"] > 0,
             dataframe["ema_fast"] > dataframe["ema_mid"],
             dataframe["ema_mid"] > dataframe["ema_slow"],
+            dataframe["market_regime"] == 1,
             dataframe["close"] > dataframe["bb_mid"],
+            dataframe["close"] > dataframe["ema_fast"],
             dataframe["rsi"].between(52, 72),
             dataframe["mfi"].between(45, 80),
-            dataframe["entry_score"] > 0.62,
+            dataframe["entry_score"] > dataframe["entry_threshold"],
             dataframe["ret_6"] > -0.03,
+            dataframe["trend_persistence"] > 0.58,
         ]
 
         if conditions:
@@ -161,7 +196,8 @@ class GlobalAIMomentumStrategy(IStrategy):
             (
                 (dataframe["close"] < dataframe["ema_fast"])
                 | (dataframe["rsi"] > 78)
-                | (dataframe["exit_score"] > 0.58)
+                | (dataframe["market_regime"] == 0)
+                | (dataframe["exit_score"] > dataframe["exit_threshold"])
                 | ((dataframe["ret_1"] < -0.02) & (dataframe["atr_pct"] > dataframe["atr_pct"].rolling(24).mean()))
             ),
         ]
