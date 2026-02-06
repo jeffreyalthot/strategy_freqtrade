@@ -83,6 +83,7 @@ class GlobalAIMomentumStrategy(IStrategy):
         dataframe["ema_mid"] = ta.EMA(dataframe, timeperiod=55)
         dataframe["ema_slow"] = ta.EMA(dataframe, timeperiod=200)
         dataframe["adx"] = ta.ADX(dataframe, timeperiod=14)
+        dataframe["ema_slope"] = ta.LINEARREG_SLOPE(dataframe["ema_fast"], timeperiod=14)
 
         # Momentum
         dataframe["rsi"] = ta.RSI(dataframe, timeperiod=14)
@@ -90,6 +91,8 @@ class GlobalAIMomentumStrategy(IStrategy):
         macd = ta.MACD(dataframe, fastperiod=12, slowperiod=26, signalperiod=9)
         dataframe["macd"] = macd["macd"]
         dataframe["macdsignal"] = macd["macdsignal"]
+        dataframe["lr_slope"] = ta.LINEARREG_SLOPE(dataframe["close"], timeperiod=14)
+        dataframe["lr_forecast"] = dataframe["close"] + dataframe["lr_slope"]
 
         # Volatility
         dataframe["atr"] = ta.ATR(dataframe, timeperiod=14)
@@ -116,9 +119,30 @@ class GlobalAIMomentumStrategy(IStrategy):
             (dataframe["close"] > dataframe["ema_fast"]).rolling(24).mean().fillna(0)
         )
         dataframe["downside_risk"] = dataframe["ret_1"].clip(upper=0).rolling(24).std()
-        dataframe["market_regime"] = (
-            (dataframe["ema_fast"] > dataframe["ema_slow"]) & (dataframe["adx"] > 18)
-        ).astype(int)
+        bb_width_quantile = dataframe["bb_width"].rolling(96, min_periods=48).quantile(0.7)
+        atr_pct_quantile = dataframe["atr_pct"].rolling(96, min_periods=48).quantile(0.7)
+
+        trend_regime = (
+            (dataframe["ema_fast"] > dataframe["ema_slow"])
+            & (dataframe["adx"] > 25)
+            & (dataframe["ema_slope"] > 0)
+        )
+        range_regime = (
+            (dataframe["adx"] < 18)
+            & (dataframe["bb_width"] < dataframe["bb_width"].rolling(96, min_periods=48).quantile(0.35))
+        )
+        volatile_regime = (dataframe["atr_pct"] > atr_pct_quantile) | (dataframe["bb_width"] > bb_width_quantile)
+
+        dataframe["market_regime"] = np.select(
+            [volatile_regime, trend_regime, range_regime],
+            [2, 1, 0],
+            default=0,
+        )
+        dataframe["market_regime_label"] = np.select(
+            [dataframe["market_regime"] == 2, dataframe["market_regime"] == 1],
+            ["volatile", "trend"],
+            default="range",
+        )
 
         # AI-like ranking score (multi-factor weighted)
         trend_strength = self._normalize_series((dataframe["ema_fast"] - dataframe["ema_slow"]) / dataframe["close"])
@@ -147,6 +171,21 @@ class GlobalAIMomentumStrategy(IStrategy):
             lower=0.56,
             upper=0.76,
         )
+        dataframe["entry_threshold_trend"] = self._clip_threshold(
+            dataframe["entry_score"].rolling(288, min_periods=96).quantile(0.72),
+            lower=0.58,
+            upper=0.78,
+        )
+        dataframe["entry_threshold_range"] = self._clip_threshold(
+            dataframe["entry_score"].rolling(288, min_periods=96).quantile(0.62),
+            lower=0.52,
+            upper=0.70,
+        )
+        dataframe["entry_threshold_volatile"] = self._clip_threshold(
+            dataframe["entry_score"].rolling(288, min_periods=96).quantile(0.76),
+            lower=0.60,
+            upper=0.82,
+        )
 
         # Exit score focuses on momentum decay + volatility expansion
         bearish_macd = self._normalize_series(dataframe["macdsignal"] - dataframe["macd"])
@@ -167,42 +206,110 @@ class GlobalAIMomentumStrategy(IStrategy):
             lower=0.52,
             upper=0.74,
         )
+        dataframe["exit_threshold_trend"] = self._clip_threshold(
+            dataframe["exit_score"].rolling(288, min_periods=96).quantile(0.62),
+            lower=0.50,
+            upper=0.72,
+        )
+        dataframe["exit_threshold_range"] = self._clip_threshold(
+            dataframe["exit_score"].rolling(288, min_periods=96).quantile(0.58),
+            lower=0.48,
+            upper=0.68,
+        )
+        dataframe["exit_threshold_volatile"] = self._clip_threshold(
+            dataframe["exit_score"].rolling(288, min_periods=96).quantile(0.70),
+            lower=0.54,
+            upper=0.78,
+        )
 
         return dataframe
 
     def populate_entry_trend(self, dataframe: pd.DataFrame, metadata: Dict) -> pd.DataFrame:
-        conditions: List[pd.Series] = [
+        base_conditions: List[pd.Series] = [
             dataframe["volume"] > 0,
-            dataframe["ema_fast"] > dataframe["ema_mid"],
-            dataframe["ema_mid"] > dataframe["ema_slow"],
-            dataframe["market_regime"] == 1,
-            dataframe["close"] > dataframe["bb_mid"],
-            dataframe["close"] > dataframe["ema_fast"],
-            dataframe["rsi"].between(52, 72),
-            dataframe["mfi"].between(45, 80),
             dataframe["entry_score"] > dataframe["entry_threshold"],
-            dataframe["ret_6"] > -0.03,
-            dataframe["trend_persistence"] > 0.58,
         ]
 
-        if conditions:
-            dataframe.loc[reduce(lambda x, y: x & y, conditions), ["enter_long", "enter_tag"]] = (1, "ai_momentum_long")
+        trend_conditions: List[pd.Series] = base_conditions + [
+            dataframe["market_regime"] == 1,
+            dataframe["ema_fast"] > dataframe["ema_mid"],
+            dataframe["ema_mid"] > dataframe["ema_slow"],
+            dataframe["close"] > dataframe["ema_fast"],
+            dataframe["close"] > dataframe["bb_mid"],
+            dataframe["rsi"].between(52, 75),
+            dataframe["mfi"].between(50, 85),
+            dataframe["entry_score"] > dataframe["entry_threshold_trend"],
+            dataframe["trend_persistence"] > 0.60,
+            dataframe["lr_slope"] > 0,
+        ]
+
+        range_conditions: List[pd.Series] = base_conditions + [
+            dataframe["market_regime"] == 0,
+            dataframe["close"] < dataframe["bb_mid"],
+            dataframe["close"] > dataframe["bb_lower"] * 0.995,
+            dataframe["rsi"].between(35, 58),
+            dataframe["mfi"].between(25, 55),
+            dataframe["entry_score"] > dataframe["entry_threshold_range"],
+            dataframe["ret_1"] > -0.02,
+        ]
+
+        volatile_conditions: List[pd.Series] = base_conditions + [
+            dataframe["market_regime"] == 2,
+            dataframe["close"] > dataframe["bb_upper"],
+            dataframe["volume_rel"] > 1.2,
+            dataframe["lr_slope"] > 0,
+            dataframe["ret_1"] > 0,
+            dataframe["entry_score"] > dataframe["entry_threshold_volatile"],
+        ]
+
+        trend_mask = reduce(lambda x, y: x & y, trend_conditions)
+        range_mask = reduce(lambda x, y: x & y, range_conditions)
+        volatile_mask = reduce(lambda x, y: x & y, volatile_conditions)
+
+        dataframe.loc[trend_mask, ["enter_long", "enter_tag"]] = (1, "ai_trend_follow")
+        dataframe.loc[range_mask, ["enter_long", "enter_tag"]] = (1, "ai_range_reversion")
+        dataframe.loc[volatile_mask, ["enter_long", "enter_tag"]] = (1, "ai_vol_breakout")
 
         return dataframe
 
     def populate_exit_trend(self, dataframe: pd.DataFrame, metadata: Dict) -> pd.DataFrame:
-        conditions: List[pd.Series] = [
+        base_conditions: List[pd.Series] = [
             dataframe["volume"] > 0,
+        ]
+
+        trend_conditions: List[pd.Series] = base_conditions + [
+            dataframe["market_regime"] == 1,
             (
-                (dataframe["close"] < dataframe["ema_fast"])
+                (dataframe["close"] < dataframe["ema_mid"])
                 | (dataframe["rsi"] > 78)
-                | (dataframe["market_regime"] == 0)
-                | (dataframe["exit_score"] > dataframe["exit_threshold"])
-                | ((dataframe["ret_1"] < -0.02) & (dataframe["atr_pct"] > dataframe["atr_pct"].rolling(24).mean()))
+                | (dataframe["exit_score"] > dataframe["exit_threshold_trend"])
             ),
         ]
 
-        if conditions:
-            dataframe.loc[reduce(lambda x, y: x & y, conditions), ["exit_long", "exit_tag"]] = (1, "ai_risk_off")
+        range_conditions: List[pd.Series] = base_conditions + [
+            dataframe["market_regime"] == 0,
+            (
+                (dataframe["close"] > dataframe["bb_mid"])
+                | (dataframe["rsi"] > 62)
+                | (dataframe["exit_score"] > dataframe["exit_threshold_range"])
+            ),
+        ]
+
+        volatile_conditions: List[pd.Series] = base_conditions + [
+            dataframe["market_regime"] == 2,
+            (
+                (dataframe["close"] < dataframe["bb_mid"])
+                | (dataframe["ret_1"] < -0.03)
+                | (dataframe["exit_score"] > dataframe["exit_threshold_volatile"])
+            ),
+        ]
+
+        trend_mask = reduce(lambda x, y: x & y, trend_conditions)
+        range_mask = reduce(lambda x, y: x & y, range_conditions)
+        volatile_mask = reduce(lambda x, y: x & y, volatile_conditions)
+
+        dataframe.loc[trend_mask, ["exit_long", "exit_tag"]] = (1, "ai_trend_exit")
+        dataframe.loc[range_mask, ["exit_long", "exit_tag"]] = (1, "ai_range_exit")
+        dataframe.loc[volatile_mask, ["exit_long", "exit_tag"]] = (1, "ai_vol_exit")
 
         return dataframe
