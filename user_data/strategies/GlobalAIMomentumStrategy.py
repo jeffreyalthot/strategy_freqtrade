@@ -60,6 +60,9 @@ class GlobalAIMomentumStrategy(IStrategy):
     volatile_roll_vol_min = DecimalParameter(0.002, 0.03, default=0.012, space="buy", optimize=True)
     bear_macd_hist_max = DecimalParameter(-1.0, -0.02, default=-0.08, space="buy", optimize=True)
     bear_rsi_max = IntParameter(20, 45, default=38, space="buy", optimize=True)
+    min_entry_edge = DecimalParameter(0.01, 0.08, default=0.035, space="buy", optimize=True)
+    volume_rel_min = DecimalParameter(0.5, 1.5, default=0.8, space="buy", optimize=True)
+    vol_spike_z_max = DecimalParameter(1.0, 3.0, default=2.0, space="buy", optimize=True)
 
     trend_weight_momentum = DecimalParameter(0.05, 0.4, default=0.18, space="buy", optimize=True)
     trend_weight_trend = DecimalParameter(0.1, 0.5, default=0.32, space="buy", optimize=True)
@@ -153,6 +156,9 @@ class GlobalAIMomentumStrategy(IStrategy):
         # Volatility
         dataframe["atr"] = ta.ATR(dataframe, timeperiod=14)
         dataframe["atr_pct"] = dataframe["atr"] / dataframe["close"].replace(0, np.nan)
+        atr_pct_mean = dataframe["atr_pct"].rolling(48, min_periods=24).mean()
+        atr_pct_std = dataframe["atr_pct"].rolling(48, min_periods=24).std().replace(0, np.nan)
+        dataframe["atr_pct_z"] = (dataframe["atr_pct"] - atr_pct_mean) / atr_pct_std
 
         bb = ta.BBANDS(dataframe, timeperiod=20, nbdevup=2.0, nbdevdn=2.0)
         dataframe["bb_upper"] = bb["upperband"]
@@ -163,6 +169,7 @@ class GlobalAIMomentumStrategy(IStrategy):
         # Volume
         dataframe["volume_mean_30"] = dataframe["volume"].rolling(30).mean()
         dataframe["volume_rel"] = dataframe["volume"] / dataframe["volume_mean_30"].replace(0, np.nan)
+        dataframe["volatility_spike"] = dataframe["atr_pct_z"] > self.vol_spike_z_max.value
 
         # Returns features
         dataframe["ret_1"] = dataframe["close"].pct_change(1)
@@ -364,6 +371,15 @@ class GlobalAIMomentumStrategy(IStrategy):
             lower=0.60,
             upper=0.86,
         )
+        dataframe["entry_edge"] = dataframe["entry_score"] - dataframe["entry_threshold"]
+        dataframe["entry_edge_trend"] = dataframe["entry_score"] - dataframe["entry_threshold_trend"]
+        dataframe["entry_edge_range"] = dataframe["entry_score"] - dataframe["entry_threshold_range"]
+        dataframe["entry_edge_volatile"] = dataframe["entry_score"] - dataframe["entry_threshold_volatile"]
+        dataframe["entry_edge_bear"] = dataframe["entry_score"] - dataframe["entry_threshold_bear"]
+        dataframe["entry_edge_bull"] = dataframe["entry_score"] - dataframe["entry_threshold_bull"]
+        dataframe["entry_edge_recovery"] = dataframe["entry_score"] - dataframe["entry_threshold_recovery"]
+        dataframe["entry_edge_distribution"] = dataframe["entry_score"] - dataframe["entry_threshold_distribution"]
+        dataframe["entry_edge_capitulation"] = dataframe["entry_score"] - dataframe["entry_threshold_capitulation"]
 
         # Exit score focuses on momentum decay + volatility expansion
         bearish_macd = self._normalize_series(dataframe["macdsignal"] - dataframe["macd"])
@@ -431,6 +447,7 @@ class GlobalAIMomentumStrategy(IStrategy):
         base_conditions: List[pd.Series] = [
             dataframe["volume"] > 0,
             dataframe["entry_score"] > dataframe["entry_threshold"],
+            dataframe["volume_rel"] > self.volume_rel_min.value,
         ]
 
         trend_conditions: List[pd.Series] = base_conditions + [
@@ -444,6 +461,8 @@ class GlobalAIMomentumStrategy(IStrategy):
             dataframe["trend_entry_score"] > dataframe["entry_threshold_trend"],
             dataframe["trend_persistence"] > 0.60,
             dataframe["lr_slope"] > 0,
+            dataframe["entry_edge_trend"] > self.min_entry_edge.value,
+            ~dataframe["volatility_spike"],
         ]
 
         range_conditions: List[pd.Series] = base_conditions + [
@@ -455,6 +474,8 @@ class GlobalAIMomentumStrategy(IStrategy):
             dataframe["range_entry_score"] > dataframe["entry_threshold_range"],
             dataframe["ret_1"] > -0.02,
             ~dataframe["range_exclusion"],
+            dataframe["entry_edge_range"] > self.min_entry_edge.value,
+            ~dataframe["volatility_spike"],
         ]
 
         volatile_conditions: List[pd.Series] = base_conditions + [
@@ -464,6 +485,7 @@ class GlobalAIMomentumStrategy(IStrategy):
             dataframe["lr_slope"] > 0,
             dataframe["ret_1"] > 0,
             dataframe["volatile_entry_score"] > dataframe["entry_threshold_volatile"],
+            dataframe["entry_edge_volatile"] > self.min_entry_edge.value,
         ]
 
         bear_conditions: List[pd.Series] = base_conditions + [
@@ -472,6 +494,7 @@ class GlobalAIMomentumStrategy(IStrategy):
             dataframe["rsi"] < self.bear_rsi_max.value,
             dataframe["bear_entry_score"] > dataframe["entry_threshold_bear"],
             dataframe["ret_1"] > -0.05,
+            dataframe["entry_edge_bear"] > self.min_entry_edge.value,
         ]
         bull_conditions: List[pd.Series] = base_conditions + [
             dataframe["market_regime"] == 4,
@@ -479,6 +502,8 @@ class GlobalAIMomentumStrategy(IStrategy):
             dataframe["rsi"].between(60, 80),
             dataframe["bull_entry_score"] > dataframe["entry_threshold_bull"],
             dataframe["ret_6"] > 0.02,
+            dataframe["entry_edge_bull"] > self.min_entry_edge.value,
+            ~dataframe["volatility_spike"],
         ]
         recovery_conditions: List[pd.Series] = base_conditions + [
             dataframe["market_regime"] == 5,
@@ -486,6 +511,8 @@ class GlobalAIMomentumStrategy(IStrategy):
             dataframe["rsi"].between(45, 65),
             dataframe["recovery_entry_score"] > dataframe["entry_threshold_recovery"],
             dataframe["ret_1"] > -0.01,
+            dataframe["entry_edge_recovery"] > self.min_entry_edge.value,
+            ~dataframe["volatility_spike"],
         ]
         distribution_conditions: List[pd.Series] = base_conditions + [
             dataframe["market_regime"] == 6,
@@ -493,6 +520,8 @@ class GlobalAIMomentumStrategy(IStrategy):
             dataframe["rsi"].between(40, 60),
             dataframe["distribution_entry_score"] > dataframe["entry_threshold_distribution"],
             dataframe["ret_1"] > -0.02,
+            dataframe["entry_edge_distribution"] > self.min_entry_edge.value,
+            ~dataframe["volatility_spike"],
         ]
         capitulation_conditions: List[pd.Series] = base_conditions + [
             dataframe["market_regime"] == 7,
@@ -500,6 +529,7 @@ class GlobalAIMomentumStrategy(IStrategy):
             dataframe["rsi"] < 35,
             dataframe["capitulation_entry_score"] > dataframe["entry_threshold_capitulation"],
             dataframe["ret_1"] > 0,
+            dataframe["entry_edge_capitulation"] > self.min_entry_edge.value,
         ]
 
         trend_mask = reduce(lambda x, y: x & y, trend_conditions)
