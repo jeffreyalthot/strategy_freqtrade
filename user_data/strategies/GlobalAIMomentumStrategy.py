@@ -62,7 +62,10 @@ class GlobalAIMomentumStrategy(IStrategy):
     bear_rsi_max = IntParameter(20, 45, default=38, space="buy", optimize=True)
     min_entry_edge = DecimalParameter(0.01, 0.08, default=0.035, space="buy", optimize=True)
     volume_rel_min = DecimalParameter(0.5, 1.5, default=0.8, space="buy", optimize=True)
+    volume_z_min = DecimalParameter(-0.5, 1.5, default=0.0, space="buy", optimize=True)
     vol_spike_z_max = DecimalParameter(1.0, 3.0, default=2.0, space="buy", optimize=True)
+    risk_downside_max = DecimalParameter(0.005, 0.04, default=0.02, space="buy", optimize=True)
+    atr_pct_z_max = DecimalParameter(0.5, 3.0, default=1.8, space="buy", optimize=True)
 
     trend_weight_momentum = DecimalParameter(0.05, 0.4, default=0.18, space="buy", optimize=True)
     trend_weight_trend = DecimalParameter(0.1, 0.5, default=0.32, space="buy", optimize=True)
@@ -168,7 +171,10 @@ class GlobalAIMomentumStrategy(IStrategy):
 
         # Volume
         dataframe["volume_mean_30"] = dataframe["volume"].rolling(30).mean()
+        dataframe["volume_std_30"] = dataframe["volume"].rolling(30).std().replace(0, np.nan)
         dataframe["volume_rel"] = dataframe["volume"] / dataframe["volume_mean_30"].replace(0, np.nan)
+        dataframe["volume_z"] = (dataframe["volume"] - dataframe["volume_mean_30"]) / dataframe["volume_std_30"]
+        dataframe["volume_z"] = dataframe["volume_z"].fillna(0).clip(-5, 5)
         dataframe["volatility_spike"] = dataframe["atr_pct_z"] > self.vol_spike_z_max.value
 
         # Returns features
@@ -448,6 +454,9 @@ class GlobalAIMomentumStrategy(IStrategy):
             dataframe["volume"] > 0,
             dataframe["entry_score"] > dataframe["entry_threshold"],
             dataframe["volume_rel"] > self.volume_rel_min.value,
+            dataframe["volume_z"] > self.volume_z_min.value,
+            dataframe["downside_risk"] < self.risk_downside_max.value,
+            dataframe["atr_pct_z"] < self.atr_pct_z_max.value,
         ]
 
         trend_conditions: List[pd.Series] = base_conditions + [
