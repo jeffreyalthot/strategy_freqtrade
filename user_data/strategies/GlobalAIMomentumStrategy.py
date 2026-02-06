@@ -132,6 +132,20 @@ class GlobalAIMomentumStrategy(IStrategy):
     def _clip_threshold(series: pd.Series, lower: float, upper: float) -> pd.Series:
         return series.fillna(lower).clip(lower=lower, upper=upper)
 
+    @staticmethod
+    def _adaptive_exit_condition(
+        confidence_high: pd.Series,
+        confidence_mid: pd.Series,
+        exit_core: pd.Series,
+        exit_price: pd.Series,
+        exit_rsi: pd.Series,
+    ) -> pd.Series:
+        return (
+            (confidence_high & exit_core)
+            | (confidence_mid & (exit_core | exit_price))
+            | (~(confidence_high | confidence_mid) & (exit_core | exit_price | exit_rsi))
+        )
+
     def populate_indicators(self, dataframe: pd.DataFrame, metadata: Dict) -> pd.DataFrame:
         # Trend
         dataframe["ema_fast"] = ta.EMA(dataframe, timeperiod=21)
@@ -440,6 +454,9 @@ class GlobalAIMomentumStrategy(IStrategy):
             lower=0.56,
             upper=0.82,
         )
+        dataframe["confidence_score"] = (
+            dataframe["entry_score"].rolling(12, min_periods=1).mean().fillna(0).clip(0, 1)
+        )
 
         return dataframe
 
@@ -556,73 +573,99 @@ class GlobalAIMomentumStrategy(IStrategy):
         base_conditions: List[pd.Series] = [
             dataframe["volume"] > 0,
         ]
+        confidence_high = dataframe["confidence_score"] >= 0.75
+        confidence_mid = dataframe["confidence_score"].between(0.62, 0.75)
 
+        trend_exit = self._adaptive_exit_condition(
+            confidence_high,
+            confidence_mid,
+            dataframe["exit_score"] > dataframe["exit_threshold_trend"],
+            dataframe["close"] < dataframe["ema_mid"],
+            dataframe["rsi"] > 78,
+        )
         trend_conditions: List[pd.Series] = base_conditions + [
             dataframe["market_regime"] == 1,
-            (
-                (dataframe["close"] < dataframe["ema_mid"])
-                | (dataframe["rsi"] > 78)
-                | (dataframe["exit_score"] > dataframe["exit_threshold_trend"])
-            ),
+            trend_exit,
         ]
 
+        range_exit = self._adaptive_exit_condition(
+            confidence_high,
+            confidence_mid,
+            dataframe["exit_score"] > dataframe["exit_threshold_range"],
+            dataframe["close"] > dataframe["bb_mid"],
+            dataframe["rsi"] > 62,
+        )
         range_conditions: List[pd.Series] = base_conditions + [
             dataframe["market_regime"] == 0,
-            (
-                (dataframe["close"] > dataframe["bb_mid"])
-                | (dataframe["rsi"] > 62)
-                | (dataframe["exit_score"] > dataframe["exit_threshold_range"])
-            ),
+            range_exit,
         ]
 
+        volatile_exit = self._adaptive_exit_condition(
+            confidence_high,
+            confidence_mid,
+            dataframe["exit_score"] > dataframe["exit_threshold_volatile"],
+            dataframe["close"] < dataframe["bb_mid"],
+            dataframe["ret_1"] < -0.03,
+        )
         volatile_conditions: List[pd.Series] = base_conditions + [
             dataframe["market_regime"] == 2,
-            (
-                (dataframe["close"] < dataframe["bb_mid"])
-                | (dataframe["ret_1"] < -0.03)
-                | (dataframe["exit_score"] > dataframe["exit_threshold_volatile"])
-            ),
+            volatile_exit,
         ]
 
+        bear_exit = self._adaptive_exit_condition(
+            confidence_high,
+            confidence_mid,
+            dataframe["exit_score"] > dataframe["exit_threshold_bear"],
+            dataframe["close"] > dataframe["ema_mid"],
+            dataframe["rsi"] > 55,
+        )
         bear_conditions: List[pd.Series] = base_conditions + [
             dataframe["market_regime"] == 3,
-            (
-                (dataframe["close"] > dataframe["ema_mid"])
-                | (dataframe["rsi"] > 55)
-                | (dataframe["exit_score"] > dataframe["exit_threshold_bear"])
-            ),
+            bear_exit,
         ]
+        bull_exit = self._adaptive_exit_condition(
+            confidence_high,
+            confidence_mid,
+            dataframe["exit_score"] > dataframe["exit_threshold_bull"],
+            dataframe["close"] < dataframe["ema_mid"],
+            dataframe["rsi"] > 82,
+        )
         bull_conditions: List[pd.Series] = base_conditions + [
             dataframe["market_regime"] == 4,
-            (
-                (dataframe["close"] < dataframe["ema_mid"])
-                | (dataframe["rsi"] > 82)
-                | (dataframe["exit_score"] > dataframe["exit_threshold_bull"])
-            ),
+            bull_exit,
         ]
+        recovery_exit = self._adaptive_exit_condition(
+            confidence_high,
+            confidence_mid,
+            dataframe["exit_score"] > dataframe["exit_threshold_recovery"],
+            dataframe["close"] < dataframe["ema_fast"],
+            dataframe["rsi"] > 70,
+        )
         recovery_conditions: List[pd.Series] = base_conditions + [
             dataframe["market_regime"] == 5,
-            (
-                (dataframe["close"] < dataframe["ema_fast"])
-                | (dataframe["rsi"] > 70)
-                | (dataframe["exit_score"] > dataframe["exit_threshold_recovery"])
-            ),
+            recovery_exit,
         ]
+        distribution_exit = self._adaptive_exit_condition(
+            confidence_high,
+            confidence_mid,
+            dataframe["exit_score"] > dataframe["exit_threshold_distribution"],
+            dataframe["close"] < dataframe["bb_mid"],
+            dataframe["rsi"] < 45,
+        )
         distribution_conditions: List[pd.Series] = base_conditions + [
             dataframe["market_regime"] == 6,
-            (
-                (dataframe["close"] < dataframe["bb_mid"])
-                | (dataframe["rsi"] < 45)
-                | (dataframe["exit_score"] > dataframe["exit_threshold_distribution"])
-            ),
+            distribution_exit,
         ]
+        capitulation_exit = self._adaptive_exit_condition(
+            confidence_high,
+            confidence_mid,
+            dataframe["exit_score"] > dataframe["exit_threshold_capitulation"],
+            dataframe["close"] < dataframe["bb_lower"],
+            dataframe["rsi"] > 50,
+        )
         capitulation_conditions: List[pd.Series] = base_conditions + [
             dataframe["market_regime"] == 7,
-            (
-                (dataframe["close"] < dataframe["bb_lower"])
-                | (dataframe["rsi"] > 50)
-                | (dataframe["exit_score"] > dataframe["exit_threshold_capitulation"])
-            ),
+            capitulation_exit,
         ]
 
         trend_mask = reduce(lambda x, y: x & y, trend_conditions)
