@@ -6,7 +6,7 @@ from typing import Dict, List
 import numpy as np
 import pandas as pd
 import talib.abstract as ta
-from freqtrade.strategy import IStrategy
+from freqtrade.strategy import DecimalParameter, IntParameter, IStrategy
 
 
 class GlobalAIMomentumStrategy(IStrategy):
@@ -48,6 +48,30 @@ class GlobalAIMomentumStrategy(IStrategy):
     exit_profit_only = False
     ignore_roi_if_entry_signal = False
 
+    trend_ema_slope_min = DecimalParameter(0.0, 0.05, default=0.006, space="buy", optimize=True)
+    trend_lr_slope_min = DecimalParameter(0.0, 0.05, default=0.004, space="buy", optimize=True)
+    range_bb_width_max = DecimalParameter(0.01, 0.08, default=0.035, space="buy", optimize=True)
+    range_rsi_band = IntParameter(4, 18, default=10, space="buy", optimize=True)
+    range_cci_abs_max = IntParameter(60, 160, default=120, space="buy", optimize=True)
+    volatile_atr_pct_min = DecimalParameter(0.004, 0.05, default=0.018, space="buy", optimize=True)
+    volatile_vol_rel_min = DecimalParameter(1.0, 2.5, default=1.25, space="buy", optimize=True)
+    volatile_roll_vol_min = DecimalParameter(0.002, 0.03, default=0.012, space="buy", optimize=True)
+    bear_macd_hist_max = DecimalParameter(-1.0, -0.02, default=-0.08, space="buy", optimize=True)
+    bear_rsi_max = IntParameter(20, 45, default=38, space="buy", optimize=True)
+
+    trend_weight_momentum = DecimalParameter(0.05, 0.4, default=0.18, space="buy", optimize=True)
+    trend_weight_trend = DecimalParameter(0.1, 0.5, default=0.32, space="buy", optimize=True)
+    trend_weight_volume = DecimalParameter(0.05, 0.3, default=0.14, space="buy", optimize=True)
+    range_weight_reversion = DecimalParameter(0.1, 0.6, default=0.32, space="buy", optimize=True)
+    range_weight_mfi = DecimalParameter(0.05, 0.4, default=0.18, space="buy", optimize=True)
+    range_weight_volatility = DecimalParameter(0.05, 0.4, default=0.20, space="buy", optimize=True)
+    volatile_weight_breakout = DecimalParameter(0.1, 0.6, default=0.35, space="buy", optimize=True)
+    volatile_weight_volume = DecimalParameter(0.05, 0.4, default=0.22, space="buy", optimize=True)
+    volatile_weight_trend = DecimalParameter(0.05, 0.4, default=0.18, space="buy", optimize=True)
+    bear_weight_rebound = DecimalParameter(0.1, 0.6, default=0.30, space="buy", optimize=True)
+    bear_weight_exhaust = DecimalParameter(0.05, 0.4, default=0.20, space="buy", optimize=True)
+    bear_weight_risk = DecimalParameter(0.05, 0.4, default=0.18, space="buy", optimize=True)
+
     plot_config = {
         "main_plot": {
             "ema_fast": {"color": "blue"},
@@ -82,6 +106,7 @@ class GlobalAIMomentumStrategy(IStrategy):
         dataframe["ema_fast"] = ta.EMA(dataframe, timeperiod=21)
         dataframe["ema_mid"] = ta.EMA(dataframe, timeperiod=55)
         dataframe["ema_slow"] = ta.EMA(dataframe, timeperiod=200)
+        dataframe["sma_long"] = ta.SMA(dataframe, timeperiod=200)
         dataframe["adx"] = ta.ADX(dataframe, timeperiod=14)
         dataframe["ema_slope"] = ta.LINEARREG_SLOPE(dataframe["ema_fast"], timeperiod=14)
 
@@ -91,8 +116,11 @@ class GlobalAIMomentumStrategy(IStrategy):
         macd = ta.MACD(dataframe, fastperiod=12, slowperiod=26, signalperiod=9)
         dataframe["macd"] = macd["macd"]
         dataframe["macdsignal"] = macd["macdsignal"]
+        dataframe["macdhist"] = macd["macdhist"]
         dataframe["lr_slope"] = ta.LINEARREG_SLOPE(dataframe["close"], timeperiod=14)
         dataframe["lr_forecast"] = dataframe["close"] + dataframe["lr_slope"]
+        dataframe["cci"] = ta.CCI(dataframe, timeperiod=20)
+        dataframe["roc"] = ta.ROC(dataframe, timeperiod=9)
 
         # Volatility
         dataframe["atr"] = ta.ATR(dataframe, timeperiod=14)
@@ -124,23 +152,41 @@ class GlobalAIMomentumStrategy(IStrategy):
 
         trend_regime = (
             (dataframe["ema_fast"] > dataframe["ema_slow"])
-            & (dataframe["adx"] > 25)
-            & (dataframe["ema_slope"] > 0)
+            & (dataframe["ema_slope"] > self.trend_ema_slope_min.value)
+            & (dataframe["lr_slope"] > self.trend_lr_slope_min.value)
         )
         range_regime = (
-            (dataframe["adx"] < 18)
-            & (dataframe["bb_width"] < dataframe["bb_width"].rolling(96, min_periods=48).quantile(0.35))
+            (dataframe["bb_width"] < self.range_bb_width_max.value)
+            & (dataframe["rsi"].between(50 - self.range_rsi_band.value, 50 + self.range_rsi_band.value))
+            & (dataframe["cci"].abs() < self.range_cci_abs_max.value)
         )
-        volatile_regime = (dataframe["atr_pct"] > atr_pct_quantile) | (dataframe["bb_width"] > bb_width_quantile)
+        dataframe["range_exclusion"] = (
+            (dataframe["bb_width"] > self.range_bb_width_max.value * 1.35)
+            | (dataframe["rsi"].sub(50).abs() > self.range_rsi_band.value * 1.35)
+        )
+        volatile_regime = (
+            (dataframe["atr_pct"] > self.volatile_atr_pct_min.value)
+            & (dataframe["volume_rel"] > self.volatile_vol_rel_min.value)
+            & (dataframe["rolling_volatility"] > self.volatile_roll_vol_min.value)
+        )
+        bear_regime = (
+            (dataframe["macdhist"] < self.bear_macd_hist_max.value)
+            & (dataframe["rsi"] < self.bear_rsi_max.value)
+            & (dataframe["close"] < dataframe["sma_long"])
+        )
 
         dataframe["market_regime"] = np.select(
-            [volatile_regime, trend_regime, range_regime],
-            [2, 1, 0],
+            [bear_regime, volatile_regime, trend_regime, range_regime],
+            [3, 2, 1, 0],
             default=0,
         )
         dataframe["market_regime_label"] = np.select(
-            [dataframe["market_regime"] == 2, dataframe["market_regime"] == 1],
-            ["volatile", "trend"],
+            [
+                dataframe["market_regime"] == 3,
+                dataframe["market_regime"] == 2,
+                dataframe["market_regime"] == 1,
+            ],
+            ["bear", "volatile", "trend"],
             default="range",
         )
 
@@ -165,6 +211,26 @@ class GlobalAIMomentumStrategy(IStrategy):
             - 0.04 * downside_penalty
         )
         dataframe["entry_score"] = dataframe["entry_score"].clip(lower=0, upper=1)
+        dataframe["trend_entry_score"] = (
+            self.trend_weight_trend.value * self._normalize_series(dataframe["ema_slope"])
+            + self.trend_weight_momentum.value * self._normalize_series(dataframe["roc"])
+            + self.trend_weight_volume.value * self._normalize_series(dataframe["volume_rel"])
+        ).clip(0, 1)
+        dataframe["range_entry_score"] = (
+            self.range_weight_reversion.value * (1 - self._normalize_series(dataframe["rsi"].sub(50).abs()))
+            + self.range_weight_mfi.value * (1 - self._normalize_series(dataframe["mfi"]))
+            + self.range_weight_volatility.value * (1 - self._normalize_series(dataframe["bb_width"]))
+        ).clip(0, 1)
+        dataframe["volatile_entry_score"] = (
+            self.volatile_weight_breakout.value * self._normalize_series(dataframe["atr_pct"])
+            + self.volatile_weight_volume.value * self._normalize_series(dataframe["volume_rel"])
+            + self.volatile_weight_trend.value * self._normalize_series(dataframe["lr_slope"])
+        ).clip(0, 1)
+        dataframe["bear_entry_score"] = (
+            self.bear_weight_rebound.value * (1 - self._normalize_series(dataframe["rsi"]))
+            + self.bear_weight_exhaust.value * (1 - self._normalize_series(dataframe["macdhist"].abs()))
+            + self.bear_weight_risk.value * (1 - self._normalize_series(dataframe["downside_risk"]))
+        ).clip(0, 1)
 
         dataframe["entry_threshold"] = self._clip_threshold(
             dataframe["entry_score"].rolling(288, min_periods=96).quantile(0.70),
@@ -185,6 +251,11 @@ class GlobalAIMomentumStrategy(IStrategy):
             dataframe["entry_score"].rolling(288, min_periods=96).quantile(0.76),
             lower=0.60,
             upper=0.82,
+        )
+        dataframe["entry_threshold_bear"] = self._clip_threshold(
+            dataframe["entry_score"].rolling(288, min_periods=96).quantile(0.78),
+            lower=0.60,
+            upper=0.84,
         )
 
         # Exit score focuses on momentum decay + volatility expansion
@@ -221,6 +292,11 @@ class GlobalAIMomentumStrategy(IStrategy):
             lower=0.54,
             upper=0.78,
         )
+        dataframe["exit_threshold_bear"] = self._clip_threshold(
+            dataframe["exit_score"].rolling(288, min_periods=96).quantile(0.72),
+            lower=0.56,
+            upper=0.80,
+        )
 
         return dataframe
 
@@ -238,7 +314,7 @@ class GlobalAIMomentumStrategy(IStrategy):
             dataframe["close"] > dataframe["bb_mid"],
             dataframe["rsi"].between(52, 75),
             dataframe["mfi"].between(50, 85),
-            dataframe["entry_score"] > dataframe["entry_threshold_trend"],
+            dataframe["trend_entry_score"] > dataframe["entry_threshold_trend"],
             dataframe["trend_persistence"] > 0.60,
             dataframe["lr_slope"] > 0,
         ]
@@ -249,8 +325,9 @@ class GlobalAIMomentumStrategy(IStrategy):
             dataframe["close"] > dataframe["bb_lower"] * 0.995,
             dataframe["rsi"].between(35, 58),
             dataframe["mfi"].between(25, 55),
-            dataframe["entry_score"] > dataframe["entry_threshold_range"],
+            dataframe["range_entry_score"] > dataframe["entry_threshold_range"],
             dataframe["ret_1"] > -0.02,
+            ~dataframe["range_exclusion"],
         ]
 
         volatile_conditions: List[pd.Series] = base_conditions + [
@@ -259,16 +336,26 @@ class GlobalAIMomentumStrategy(IStrategy):
             dataframe["volume_rel"] > 1.2,
             dataframe["lr_slope"] > 0,
             dataframe["ret_1"] > 0,
-            dataframe["entry_score"] > dataframe["entry_threshold_volatile"],
+            dataframe["volatile_entry_score"] > dataframe["entry_threshold_volatile"],
+        ]
+
+        bear_conditions: List[pd.Series] = base_conditions + [
+            dataframe["market_regime"] == 3,
+            dataframe["close"] < dataframe["sma_long"],
+            dataframe["rsi"] < self.bear_rsi_max.value,
+            dataframe["bear_entry_score"] > dataframe["entry_threshold_bear"],
+            dataframe["ret_1"] > -0.05,
         ]
 
         trend_mask = reduce(lambda x, y: x & y, trend_conditions)
         range_mask = reduce(lambda x, y: x & y, range_conditions)
         volatile_mask = reduce(lambda x, y: x & y, volatile_conditions)
+        bear_mask = reduce(lambda x, y: x & y, bear_conditions)
 
         dataframe.loc[trend_mask, ["enter_long", "enter_tag"]] = (1, "ai_trend_follow")
         dataframe.loc[range_mask, ["enter_long", "enter_tag"]] = (1, "ai_range_reversion")
         dataframe.loc[volatile_mask, ["enter_long", "enter_tag"]] = (1, "ai_vol_breakout")
+        dataframe.loc[bear_mask, ["enter_long", "enter_tag"]] = (1, "ai_bear_rebound")
 
         return dataframe
 
@@ -304,12 +391,23 @@ class GlobalAIMomentumStrategy(IStrategy):
             ),
         ]
 
+        bear_conditions: List[pd.Series] = base_conditions + [
+            dataframe["market_regime"] == 3,
+            (
+                (dataframe["close"] > dataframe["ema_mid"])
+                | (dataframe["rsi"] > 55)
+                | (dataframe["exit_score"] > dataframe["exit_threshold_bear"])
+            ),
+        ]
+
         trend_mask = reduce(lambda x, y: x & y, trend_conditions)
         range_mask = reduce(lambda x, y: x & y, range_conditions)
         volatile_mask = reduce(lambda x, y: x & y, volatile_conditions)
+        bear_mask = reduce(lambda x, y: x & y, bear_conditions)
 
         dataframe.loc[trend_mask, ["exit_long", "exit_tag"]] = (1, "ai_trend_exit")
         dataframe.loc[range_mask, ["exit_long", "exit_tag"]] = (1, "ai_range_exit")
         dataframe.loc[volatile_mask, ["exit_long", "exit_tag"]] = (1, "ai_vol_exit")
+        dataframe.loc[bear_mask, ["exit_long", "exit_tag"]] = (1, "ai_bear_exit")
 
         return dataframe
