@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import reduce
-from typing import Dict, List
+from itertools import product
+from typing import Any, Callable, Dict, Iterable, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -16,7 +18,7 @@ class GlobalAIMomentumStrategy(IStrategy):
     Objectif:
     - Combiner momentum, tendance, volatilité et volume.
     - Construire un score d'entrée/sortie inspiré d'un modèle de ranking.
-    - Fournir une base solide pour optimisation hyperopt.
+    - Fournir une base solide pour itération et optimisation manuelle.
 
     Remarque:
     Cette stratégie n'est PAS la "meilleure du monde" de manière universelle.
@@ -89,6 +91,32 @@ class GlobalAIMomentumStrategy(IStrategy):
             },
         },
     }
+
+    @staticmethod
+    def optimizer_loop(
+        param_space: Dict[str, Iterable[Any]],
+        evaluate: Callable[[Dict[str, Any]], Tuple[float, Dict[str, Any]]],
+        max_workers: int = 8,
+    ) -> Dict[str, Any]:
+        """
+        Lance une boucle d'optimisation parallèle (non bloquante) pour évaluer
+        un maximum de combinaisons de paramètres. Retourne la meilleure config.
+        """
+        keys = list(param_space.keys())
+        combos = (dict(zip(keys, values)) for values in product(*param_space.values()))
+
+        best_score = float("-inf")
+        best_params: Dict[str, Any] = {}
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(evaluate, params): params for params in combos}
+            for future in as_completed(futures):
+                score, params = future.result()
+                if score > best_score:
+                    best_score = score
+                    best_params = params
+
+        return {"score": best_score, "params": best_params}
 
     @staticmethod
     def _normalize_series(series: pd.Series, window: int = 96) -> pd.Series:
@@ -174,19 +202,57 @@ class GlobalAIMomentumStrategy(IStrategy):
             & (dataframe["rsi"] < self.bear_rsi_max.value)
             & (dataframe["close"] < dataframe["sma_long"])
         )
+        bull_regime = (
+            (dataframe["ema_fast"] > dataframe["ema_slow"])
+            & (dataframe["adx"] > 25)
+            & (dataframe["rsi"] > 60)
+            & (dataframe["macdhist"] > 0)
+        )
+        recovery_regime = (
+            (dataframe["ema_fast"] > dataframe["ema_mid"])
+            & (dataframe["close"] > dataframe["ema_mid"])
+            & (dataframe["rsi"].between(45, 62))
+            & (dataframe["macd"] > dataframe["macdsignal"])
+        )
+        distribution_regime = (
+            (dataframe["close"] > dataframe["sma_long"])
+            & (dataframe["ema_fast"] < dataframe["ema_mid"])
+            & (dataframe["rsi"].between(55, 70))
+            & (dataframe["macdhist"] < 0)
+        )
+        capitulation_regime = (
+            (dataframe["rsi"] < 25)
+            & (dataframe["ret_6"] < -0.06)
+            & (dataframe["atr_pct"] > atr_pct_quantile)
+            & (dataframe["volume_rel"] > self.volatile_vol_rel_min.value)
+            & (dataframe["close"] < dataframe["bb_lower"])
+        )
 
         dataframe["market_regime"] = np.select(
-            [bear_regime, volatile_regime, trend_regime, range_regime],
-            [3, 2, 1, 0],
+            [
+                capitulation_regime,
+                bear_regime,
+                distribution_regime,
+                volatile_regime,
+                bull_regime,
+                trend_regime,
+                recovery_regime,
+                range_regime,
+            ],
+            [7, 3, 6, 2, 4, 1, 5, 0],
             default=0,
         )
         dataframe["market_regime_label"] = np.select(
             [
+                dataframe["market_regime"] == 7,
+                dataframe["market_regime"] == 6,
+                dataframe["market_regime"] == 5,
+                dataframe["market_regime"] == 4,
                 dataframe["market_regime"] == 3,
                 dataframe["market_regime"] == 2,
                 dataframe["market_regime"] == 1,
             ],
-            ["bear", "volatile", "trend"],
+            ["capitulation", "distribution", "recovery", "bull", "bear", "volatile", "trend"],
             default="range",
         )
 
@@ -231,6 +297,27 @@ class GlobalAIMomentumStrategy(IStrategy):
             + self.bear_weight_exhaust.value * (1 - self._normalize_series(dataframe["macdhist"].abs()))
             + self.bear_weight_risk.value * (1 - self._normalize_series(dataframe["downside_risk"]))
         ).clip(0, 1)
+        dataframe["bull_entry_score"] = (
+            0.40 * trend_strength
+            + 0.30 * self._normalize_series(dataframe["roc"])
+            + 0.30 * volume_quality
+        ).clip(0, 1)
+        dataframe["recovery_entry_score"] = (
+            0.35 * self._normalize_series(dataframe["rsi"])
+            + 0.30 * self._normalize_series(dataframe["macd"] - dataframe["macdsignal"])
+            + 0.20 * (1 - downside_penalty)
+            + 0.15 * persistence_quality
+        ).clip(0, 1)
+        dataframe["distribution_entry_score"] = (
+            0.45 * (1 - self._normalize_series(dataframe["macdhist"]))
+            + 0.35 * (1 - self._normalize_series(dataframe["rsi"]))
+            + 0.20 * volatility_quality
+        ).clip(0, 1)
+        dataframe["capitulation_entry_score"] = (
+            0.45 * (1 - self._normalize_series(dataframe["rsi"]))
+            + 0.35 * self._normalize_series(dataframe["volume_rel"])
+            + 0.20 * (1 - self._normalize_series(dataframe["atr_pct"]))
+        ).clip(0, 1)
 
         dataframe["entry_threshold"] = self._clip_threshold(
             dataframe["entry_score"].rolling(288, min_periods=96).quantile(0.70),
@@ -256,6 +343,26 @@ class GlobalAIMomentumStrategy(IStrategy):
             dataframe["entry_score"].rolling(288, min_periods=96).quantile(0.78),
             lower=0.60,
             upper=0.84,
+        )
+        dataframe["entry_threshold_bull"] = self._clip_threshold(
+            dataframe["entry_score"].rolling(288, min_periods=96).quantile(0.74),
+            lower=0.60,
+            upper=0.80,
+        )
+        dataframe["entry_threshold_recovery"] = self._clip_threshold(
+            dataframe["entry_score"].rolling(288, min_periods=96).quantile(0.68),
+            lower=0.56,
+            upper=0.76,
+        )
+        dataframe["entry_threshold_distribution"] = self._clip_threshold(
+            dataframe["entry_score"].rolling(288, min_periods=96).quantile(0.66),
+            lower=0.54,
+            upper=0.72,
+        )
+        dataframe["entry_threshold_capitulation"] = self._clip_threshold(
+            dataframe["entry_score"].rolling(288, min_periods=96).quantile(0.80),
+            lower=0.60,
+            upper=0.86,
         )
 
         # Exit score focuses on momentum decay + volatility expansion
@@ -296,6 +403,26 @@ class GlobalAIMomentumStrategy(IStrategy):
             dataframe["exit_score"].rolling(288, min_periods=96).quantile(0.72),
             lower=0.56,
             upper=0.80,
+        )
+        dataframe["exit_threshold_bull"] = self._clip_threshold(
+            dataframe["exit_score"].rolling(288, min_periods=96).quantile(0.64),
+            lower=0.52,
+            upper=0.74,
+        )
+        dataframe["exit_threshold_recovery"] = self._clip_threshold(
+            dataframe["exit_score"].rolling(288, min_periods=96).quantile(0.66),
+            lower=0.52,
+            upper=0.76,
+        )
+        dataframe["exit_threshold_distribution"] = self._clip_threshold(
+            dataframe["exit_score"].rolling(288, min_periods=96).quantile(0.70),
+            lower=0.54,
+            upper=0.78,
+        )
+        dataframe["exit_threshold_capitulation"] = self._clip_threshold(
+            dataframe["exit_score"].rolling(288, min_periods=96).quantile(0.76),
+            lower=0.56,
+            upper=0.82,
         )
 
         return dataframe
@@ -346,16 +473,52 @@ class GlobalAIMomentumStrategy(IStrategy):
             dataframe["bear_entry_score"] > dataframe["entry_threshold_bear"],
             dataframe["ret_1"] > -0.05,
         ]
+        bull_conditions: List[pd.Series] = base_conditions + [
+            dataframe["market_regime"] == 4,
+            dataframe["close"] > dataframe["ema_fast"],
+            dataframe["rsi"].between(60, 80),
+            dataframe["bull_entry_score"] > dataframe["entry_threshold_bull"],
+            dataframe["ret_6"] > 0.02,
+        ]
+        recovery_conditions: List[pd.Series] = base_conditions + [
+            dataframe["market_regime"] == 5,
+            dataframe["close"] > dataframe["ema_mid"],
+            dataframe["rsi"].between(45, 65),
+            dataframe["recovery_entry_score"] > dataframe["entry_threshold_recovery"],
+            dataframe["ret_1"] > -0.01,
+        ]
+        distribution_conditions: List[pd.Series] = base_conditions + [
+            dataframe["market_regime"] == 6,
+            dataframe["close"] > dataframe["bb_lower"] * 0.99,
+            dataframe["rsi"].between(40, 60),
+            dataframe["distribution_entry_score"] > dataframe["entry_threshold_distribution"],
+            dataframe["ret_1"] > -0.02,
+        ]
+        capitulation_conditions: List[pd.Series] = base_conditions + [
+            dataframe["market_regime"] == 7,
+            dataframe["close"] > dataframe["bb_lower"],
+            dataframe["rsi"] < 35,
+            dataframe["capitulation_entry_score"] > dataframe["entry_threshold_capitulation"],
+            dataframe["ret_1"] > 0,
+        ]
 
         trend_mask = reduce(lambda x, y: x & y, trend_conditions)
         range_mask = reduce(lambda x, y: x & y, range_conditions)
         volatile_mask = reduce(lambda x, y: x & y, volatile_conditions)
         bear_mask = reduce(lambda x, y: x & y, bear_conditions)
+        bull_mask = reduce(lambda x, y: x & y, bull_conditions)
+        recovery_mask = reduce(lambda x, y: x & y, recovery_conditions)
+        distribution_mask = reduce(lambda x, y: x & y, distribution_conditions)
+        capitulation_mask = reduce(lambda x, y: x & y, capitulation_conditions)
 
         dataframe.loc[trend_mask, ["enter_long", "enter_tag"]] = (1, "ai_trend_follow")
         dataframe.loc[range_mask, ["enter_long", "enter_tag"]] = (1, "ai_range_reversion")
         dataframe.loc[volatile_mask, ["enter_long", "enter_tag"]] = (1, "ai_vol_breakout")
         dataframe.loc[bear_mask, ["enter_long", "enter_tag"]] = (1, "ai_bear_rebound")
+        dataframe.loc[bull_mask, ["enter_long", "enter_tag"]] = (1, "ai_bull_momentum")
+        dataframe.loc[recovery_mask, ["enter_long", "enter_tag"]] = (1, "ai_recovery")
+        dataframe.loc[distribution_mask, ["enter_long", "enter_tag"]] = (1, "ai_distribution_rebound")
+        dataframe.loc[capitulation_mask, ["enter_long", "enter_tag"]] = (1, "ai_capitulation_snap")
 
         return dataframe
 
@@ -399,15 +562,55 @@ class GlobalAIMomentumStrategy(IStrategy):
                 | (dataframe["exit_score"] > dataframe["exit_threshold_bear"])
             ),
         ]
+        bull_conditions: List[pd.Series] = base_conditions + [
+            dataframe["market_regime"] == 4,
+            (
+                (dataframe["close"] < dataframe["ema_mid"])
+                | (dataframe["rsi"] > 82)
+                | (dataframe["exit_score"] > dataframe["exit_threshold_bull"])
+            ),
+        ]
+        recovery_conditions: List[pd.Series] = base_conditions + [
+            dataframe["market_regime"] == 5,
+            (
+                (dataframe["close"] < dataframe["ema_fast"])
+                | (dataframe["rsi"] > 70)
+                | (dataframe["exit_score"] > dataframe["exit_threshold_recovery"])
+            ),
+        ]
+        distribution_conditions: List[pd.Series] = base_conditions + [
+            dataframe["market_regime"] == 6,
+            (
+                (dataframe["close"] < dataframe["bb_mid"])
+                | (dataframe["rsi"] < 45)
+                | (dataframe["exit_score"] > dataframe["exit_threshold_distribution"])
+            ),
+        ]
+        capitulation_conditions: List[pd.Series] = base_conditions + [
+            dataframe["market_regime"] == 7,
+            (
+                (dataframe["close"] < dataframe["bb_lower"])
+                | (dataframe["rsi"] > 50)
+                | (dataframe["exit_score"] > dataframe["exit_threshold_capitulation"])
+            ),
+        ]
 
         trend_mask = reduce(lambda x, y: x & y, trend_conditions)
         range_mask = reduce(lambda x, y: x & y, range_conditions)
         volatile_mask = reduce(lambda x, y: x & y, volatile_conditions)
         bear_mask = reduce(lambda x, y: x & y, bear_conditions)
+        bull_mask = reduce(lambda x, y: x & y, bull_conditions)
+        recovery_mask = reduce(lambda x, y: x & y, recovery_conditions)
+        distribution_mask = reduce(lambda x, y: x & y, distribution_conditions)
+        capitulation_mask = reduce(lambda x, y: x & y, capitulation_conditions)
 
         dataframe.loc[trend_mask, ["exit_long", "exit_tag"]] = (1, "ai_trend_exit")
         dataframe.loc[range_mask, ["exit_long", "exit_tag"]] = (1, "ai_range_exit")
         dataframe.loc[volatile_mask, ["exit_long", "exit_tag"]] = (1, "ai_vol_exit")
         dataframe.loc[bear_mask, ["exit_long", "exit_tag"]] = (1, "ai_bear_exit")
+        dataframe.loc[bull_mask, ["exit_long", "exit_tag"]] = (1, "ai_bull_exit")
+        dataframe.loc[recovery_mask, ["exit_long", "exit_tag"]] = (1, "ai_recovery_exit")
+        dataframe.loc[distribution_mask, ["exit_long", "exit_tag"]] = (1, "ai_distribution_exit")
+        dataframe.loc[capitulation_mask, ["exit_long", "exit_tag"]] = (1, "ai_capitulation_exit")
 
         return dataframe
