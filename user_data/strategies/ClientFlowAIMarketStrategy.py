@@ -11,7 +11,7 @@ from freqtrade.strategy import IStrategy, merge_informative_pair
 
 class ClientFlowAIMarketStrategy(IStrategy):
     """
-    Stratégie orientée "profilage" des flux acheteurs/vendeurs.
+    Stratégie orientée "reconnaissance de profils clients" à partir des flux.
 
     ⚠️ Limite importante : Freqtrade ne fournit pas l'identité des clients
     ni les carnets d'ordre détaillés. Cette stratégie simule donc un
@@ -21,8 +21,10 @@ class ClientFlowAIMarketStrategy(IStrategy):
     Objectif :
     - Surveiller plusieurs timeframes (1m -> 3d) pour détecter la cohérence
       des flux.
+    - Regrouper les comportements en profils synthétiques (suiveur de tendance,
+      retour à la moyenne, breakout). Les profils incohérents sont filtrés.
     - Construire un score analytique (type IA légère) pour estimer les zones
-      de valeur basse (buy) et haute (sell).
+      de valeur basse (buy) et haute (sell) en cohérence avec les profils.
     """
 
     INTERFACE_VERSION = 3
@@ -52,11 +54,13 @@ class ClientFlowAIMarketStrategy(IStrategy):
         "main_plot": {
             "value_score": {"color": "green"},
             "flow_coherence": {"color": "orange"},
+            "profile_alignment": {"color": "purple"},
         },
         "subplots": {
             "AI Flow": {
                 "ai_entry_score": {"color": "blue"},
                 "ai_exit_score": {"color": "red"},
+                "incoherence_score": {"color": "gray"},
             }
         },
     }
@@ -99,6 +103,25 @@ class ClientFlowAIMarketStrategy(IStrategy):
             + 0.3 * dataframe[f"flow_volume{suffix}"]
             - 0.2 * dataframe[f"flow_volatility{suffix}"]
         )
+        momentum = ta.ROC(dataframe[f"close{suffix}"], timeperiod=9).fillna(0)
+        reversion = (dataframe[f"close{suffix}"] - ta.SMA(dataframe[f"close{suffix}"], timeperiod=20)).fillna(0)
+        range_pos = (
+            (dataframe[f"close{suffix}"] - dataframe[f"low{suffix}"])
+            / (spread.replace(0, np.nan))
+        ).fillna(0.5)
+        dataframe[f"profile_trend{suffix}"] = self._tanh_clip(
+            self._zscore(momentum, 48) + dataframe[f"flow_pressure{suffix}"]
+        )
+        dataframe[f"profile_reversion{suffix}"] = self._tanh_clip(
+            -self._zscore(reversion, 48) + (0.5 - range_pos)
+        )
+        dataframe[f"profile_breakout{suffix}"] = self._tanh_clip(
+            dataframe[f"flow_coherence{suffix}"] + self._zscore(volatility, 48).fillna(0)
+        )
+        dataframe[f"incoherence_score{suffix}"] = self._tanh_clip(
+            self._zscore(abs(dataframe[f"flow_pressure{suffix}"]), 48).fillna(0)
+            - dataframe[f"flow_volume{suffix}"]
+        )
         return dataframe
 
     def populate_indicators(self, dataframe: pd.DataFrame, metadata: Dict) -> pd.DataFrame:
@@ -113,6 +136,7 @@ class ClientFlowAIMarketStrategy(IStrategy):
         dataframe["value_score"] = self._tanh_clip(
             self._zscore(dataframe["close"], 96)
             + self._zscore(dataframe["flow_coherence"], 96).fillna(0)
+            - dataframe["incoherence_score"].fillna(0)
         )
 
         flow_columns = [
@@ -130,12 +154,75 @@ class ClientFlowAIMarketStrategy(IStrategy):
                 lambda left, right: left + right,
                 [dataframe[col].fillna(0) for col in flow_available],
             ) / len(flow_available)
+        incoherence_columns = [
+            "incoherence_score_1m",
+            "incoherence_score_10m",
+            "incoherence_score_15m",
+            "incoherence_score_30m",
+            "incoherence_score_1h",
+            "incoherence_score_1d",
+            "incoherence_score_3d",
+        ]
+        incoherence_available = [col for col in incoherence_columns if col in dataframe]
+        if incoherence_available:
+            dataframe["incoherence_score"] = reduce(
+                lambda left, right: left + right,
+                [dataframe[col].fillna(0) for col in incoherence_available],
+            ) / len(incoherence_available)
+
+        profile_columns = [
+            "profile_trend_1m",
+            "profile_trend_10m",
+            "profile_trend_15m",
+            "profile_trend_30m",
+            "profile_trend_1h",
+            "profile_trend_1d",
+            "profile_trend_3d",
+        ]
+        reversion_columns = [
+            "profile_reversion_1m",
+            "profile_reversion_10m",
+            "profile_reversion_15m",
+            "profile_reversion_30m",
+            "profile_reversion_1h",
+            "profile_reversion_1d",
+            "profile_reversion_3d",
+        ]
+        breakout_columns = [
+            "profile_breakout_1m",
+            "profile_breakout_10m",
+            "profile_breakout_15m",
+            "profile_breakout_30m",
+            "profile_breakout_1h",
+            "profile_breakout_1d",
+            "profile_breakout_3d",
+        ]
+
+        def _avg_profile(cols: List[str]) -> pd.Series:
+            available = [col for col in cols if col in dataframe]
+            if not available:
+                return pd.Series(index=dataframe.index, data=0.0)
+            return (
+                reduce(lambda left, right: left + right, [dataframe[col].fillna(0) for col in available])
+                / len(available)
+            )
+
+        dataframe["profile_trend"] = _avg_profile(profile_columns)
+        dataframe["profile_reversion"] = _avg_profile(reversion_columns)
+        dataframe["profile_breakout"] = _avg_profile(breakout_columns)
+        dataframe["profile_alignment"] = self._tanh_clip(
+            dataframe["profile_trend"] + dataframe["profile_reversion"] + dataframe["profile_breakout"]
+        )
 
         dataframe["ai_entry_score"] = self._tanh_clip(
-            -dataframe["value_score"] + dataframe["flow_coherence"].fillna(0)
+            -dataframe["value_score"]
+            + dataframe["flow_coherence"].fillna(0)
+            + dataframe["profile_alignment"].fillna(0)
         )
         dataframe["ai_exit_score"] = self._tanh_clip(
-            dataframe["value_score"] - dataframe["flow_coherence"].fillna(0)
+            dataframe["value_score"]
+            - dataframe["flow_coherence"].fillna(0)
+            - dataframe["profile_alignment"].fillna(0)
         )
 
         return dataframe
@@ -145,6 +232,8 @@ class ClientFlowAIMarketStrategy(IStrategy):
             (
                 (dataframe["ai_entry_score"] > 0.4)
                 & (dataframe["flow_coherence"] > 0.05)
+                & (dataframe["profile_alignment"] > 0.05)
+                & (dataframe["incoherence_score"] < 0.2)
                 & (dataframe["volume"] > 0)
             ),
             "enter_long",
@@ -157,6 +246,7 @@ class ClientFlowAIMarketStrategy(IStrategy):
             (
                 (dataframe["ai_exit_score"] > 0.35)
                 | (dataframe["flow_coherence"] < -0.1)
+                | (dataframe["incoherence_score"] > 0.35)
             ),
             "exit_long",
         ] = 1
