@@ -19,8 +19,8 @@ class ClientFlowAIMarketStrategy(IStrategy):
     et de vente) dérivés des chandelles, du volume et de la volatilité.
 
     Objectif :
-    - Surveiller plusieurs timeframes (1m -> 3d) pour détecter la cohérence
-      des flux.
+    - Surveiller plusieurs timeframes (1s -> 3d si disponible) pour détecter
+      la cohérence des flux. La récupération 1s dépend de l'exchange/données.
     - Regrouper les comportements en profils synthétiques (suiveur de tendance,
       retour à la moyenne, breakout). Les profils incohérents sont filtrés.
     - Construire un score analytique (type IA légère) pour estimer les zones
@@ -67,7 +67,7 @@ class ClientFlowAIMarketStrategy(IStrategy):
 
     def informative_pairs(self) -> List[Tuple[str, str]]:
         pairs = self.dp.current_whitelist() if self.dp else []
-        timeframes = ["1m", "5m", "10m", "15m", "30m", "1h", "1d", "3d"]
+        timeframes = ["1s", "1m", "5m", "10m", "15m", "30m", "1h", "1d", "3d"]
         return [(pair, tf) for pair in pairs for tf in timeframes if tf != self.timeframe]
 
     @staticmethod
@@ -128,8 +128,11 @@ class ClientFlowAIMarketStrategy(IStrategy):
         dataframe = self._flow_profile(dataframe, "")
 
         if self.dp:
-            for tf in ["1m", "10m", "15m", "30m", "1h", "1d", "3d"]:
-                info = self.dp.get_pair_dataframe(metadata["pair"], tf)
+            for tf in ["1s", "1m", "10m", "15m", "30m", "1h", "1d", "3d"]:
+                try:
+                    info = self.dp.get_pair_dataframe(metadata["pair"], tf)
+                except Exception:
+                    continue
                 info = self._flow_profile(info, "")
                 dataframe = merge_informative_pair(dataframe, info, self.timeframe, tf, ffill=True)
 
@@ -140,6 +143,7 @@ class ClientFlowAIMarketStrategy(IStrategy):
         )
 
         flow_columns = [
+            "flow_coherence_1s",
             "flow_coherence_1m",
             "flow_coherence_10m",
             "flow_coherence_15m",
@@ -155,6 +159,7 @@ class ClientFlowAIMarketStrategy(IStrategy):
                 [dataframe[col].fillna(0) for col in flow_available],
             ) / len(flow_available)
         incoherence_columns = [
+            "incoherence_score_1s",
             "incoherence_score_1m",
             "incoherence_score_10m",
             "incoherence_score_15m",
@@ -171,6 +176,7 @@ class ClientFlowAIMarketStrategy(IStrategy):
             ) / len(incoherence_available)
 
         profile_columns = [
+            "profile_trend_1s",
             "profile_trend_1m",
             "profile_trend_10m",
             "profile_trend_15m",
@@ -180,6 +186,7 @@ class ClientFlowAIMarketStrategy(IStrategy):
             "profile_trend_3d",
         ]
         reversion_columns = [
+            "profile_reversion_1s",
             "profile_reversion_1m",
             "profile_reversion_10m",
             "profile_reversion_15m",
@@ -189,6 +196,7 @@ class ClientFlowAIMarketStrategy(IStrategy):
             "profile_reversion_3d",
         ]
         breakout_columns = [
+            "profile_breakout_1s",
             "profile_breakout_1m",
             "profile_breakout_10m",
             "profile_breakout_15m",
